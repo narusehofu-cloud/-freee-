@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>freeeインポート用変換ツール（収入取引・明細データ用 最終完全版）</title>
+    <style>
+        body {
+            font-family: 'Meiryo', sans-serif;
+            background-color: #f4f5f7;
+            color: #333;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+        }
+        .container {
+            background-color: #fff;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 4px 10px rgba(0,0,0,0.1);
+            width: 100%;
+            max-width: 550px;
+            text-align: center;
+        }
+        h1 { font-size: 20px; margin-bottom: 20px; }
+        .drop-area {
+            border: 2px dashed #a0aabf; background-color: #e1e4e8;
+            padding: 40px 20px; border-radius: 8px; cursor: pointer;
+            transition: background-color 0.2s; margin-bottom: 20px;
+        }
+        .drop-area.dragover { background-color: #c8d1dd; border-color: #4CAF50; }
+        .drop-area p { margin: 0 0 15px 0; color: #555; font-size: 14px; line-height: 1.5; }
+        input[type="file"] { display: none; }
+        .btn-select {
+            background-color: #fff; border: 1px solid #ccc;
+            padding: 8px 16px; border-radius: 4px; cursor: pointer; font-size: 13px;
+        }
+        .btn-select:hover { background-color: #f0f0f0; }
+        .file-list {
+            text-align: left; font-size: 13px; background: #fff; border: 1px solid #ccc;
+            height: 80px; overflow-y: auto; padding: 5px; margin-bottom: 20px;
+        }
+        .btn-execute {
+            background-color: #4CAF50; color: white; border: none;
+            padding: 12px 24px; font-size: 16px; font-weight: bold;
+            border-radius: 4px; cursor: pointer; width: 100%; transition: background-color 0.2s;
+        }
+        .btn-execute:hover { background-color: #45a049; }
+        .btn-execute:disabled { background-color: #cccccc; cursor: not-allowed; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>freee変換ツール (明細・複合仕訳 最終版)</h1>
+    
+    <div class="drop-area" id="dropArea">
+        <p>ここに「明細データ」のCSV/TSVファイルを<br>ドラッグ＆ドロップしてください<br>（複数ファイル対応）</p>
+        <button class="btn-select" onclick="document.getElementById('fileInput').click()">または ファイルを選択</button>
+        <input type="file" id="fileInput" multiple accept=".csv, .tsv, text/csv, text/tab-separated-values">
+    </div>
+
+    <div class="file-list" id="fileList"></div>
+
+    <button class="btn-execute" id="executeBtn" disabled>Excelに変換してダウンロード</button>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jschardet/3.0.0/jschardet.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.3.0/exceljs.min.js"></script>
+
+<script>
+    const dropArea = document.getElementById('dropArea');
+    const fileInput = document.getElementById('fileInput');
+    const fileList = document.getElementById('fileList');
+    const executeBtn = document.getElementById('executeBtn');
+    let selectedFiles = [];
+
+    // --- UIイベント設定 ---
+    ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
+        dropArea.addEventListener(eventName, e => { e.preventDefault(); e.stopPropagation(); }, false);
+    });
+    ['dragenter', 'dragover'].forEach(eventName => {
+        dropArea.addEventListener(eventName, () => dropArea.classList.add('dragover'), false);
+    });
+    ['dragleave', 'drop'].forEach(eventName => {
+        dropArea.addEventListener(eventName, () => dropArea.classList.remove('dragover'), false);
+    });
+
+    dropArea.addEventListener('drop', (e) => handleFiles(e.dataTransfer.files), false);
+    fileInput.addEventListener('change', (e) => handleFiles(e.target.files), false);
+
+    function handleFiles(files) {
+        for (let i = 0; i < files.length; i++) {
+            if (!selectedFiles.some(f => f.name === files[i].name)) {
+                selectedFiles.push(files[i]);
+            }
+        }
+        updateFileList();
+    }
+
+    function updateFileList() {
+        fileList.innerHTML = selectedFiles.map(f => `<div>${f.name}</div>`).join('');
+        executeBtn.disabled = selectedFiles.length === 0;
+    }
+
+    // --- データクレンジング ---
+    function cleanValue(val) {
+        if (!val) return 0;
+        let str = String(val).replace(/￥/g, '').replace(/\\/g, '').replace(/,/g, '').replace(/"/g, '').trim();
+        if (str === '-' || str === '') return 0;
+        let num = parseFloat(str);
+        return isNaN(num) ? 0 : num;
+    }
+
+    // --- ファイル読み込みとエンコード判定 ---
+    function readFileAsync(file) {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                const buffer = new Uint8Array(e.target.result);
+                let binaryString = "";
+                for (let i = 0; i < Math.min(buffer.length, 1000); i++) {
+                    binaryString += String.fromCharCode(buffer[i]);
+                }
+                const detected = jschardet.detect(binaryString);
+                let encoding = detected.encoding || 'utf-8';
+                
+                if (encoding.toLowerCase().includes('utf-16')) encoding = 'utf-16le';
+                if (encoding.toLowerCase().includes('shift_jis') || encoding.toLowerCase().includes('windows-31j')) encoding = 'shift_jis';
+
+                const decoder = new TextDecoder(encoding);
+                resolve(decoder.decode(buffer));
+            };
+            reader.onerror = reject;
+            reader.readAsArrayBuffer(file);
+        });
+    }
+
+    // --- メイン処理 ---
+    executeBtn.addEventListener('click', async () => {
+        try {
+            executeBtn.disabled = true;
+            executeBtn.innerText = "処理中...";
+
+            for (let file of selectedFiles) {
+                const csvText = await readFileAsync(file);
+                
+                // PapaParseで安全にCSVを解析（カンマでの列ズレを完全に防止）
+                const parsed = Papa.parse(csvText, { skipEmptyLines: true });
+                const lines = parsed.data;
+
+                // ヘッダー行を特定
+                let headerIdx = -1;
+                for (let i = 0; i < lines.length; i++) {
+                    if (lines[i].includes('H.伝票番号')) {
+                        headerIdx = i;
+                        break;
+                    }
+                }
+
+                if (headerIdx === -1) {
+                    alert(`${file.name} にはヘッダー行（H.伝票番号）が見つかりませんでした。`);
+                    continue;
+                }
+
+                const header = lines[headerIdx].map(h => String(h).trim().replace(/"/g, ''));
+                
+                const csvPayCols = {
+                    'H.支払金額（現金）': '現金',
+                    'H.支払金額（クレジットカード）': 'クレジット',
+                    'H.支払金額（ポイント）': 'ポイント',
+                    'H.支払金額（電子マネー）': '電子マネー',
+                    'H.支払金額（商品券：釣り無）': '商品券無',
+                    'H.商品券差額': '商品券差額',
+                    'H.支払金額（商品券：釣り有）': '商品券有',
+                    'H.商品券現金釣銭': '商品券現金釣銭',
+                    'H.支払金額（その他）': '掛売'
+                };
+
+                const payProperties = {
+                    '現金': { item: '【成瀬】現金（USENレジ）', isUncol: false },
+                    'クレジット': { item: '【成瀬】クレジット（USENレジ）', isUncol: false },
+                    'ポイント': { item: '【成瀬】ポイント（USENレジ）', isUncol: false },
+                    '電子マネー': { item: '【成瀬】電子マネー（USENレジ）', isUncol: false },
+                    '商品券無': { item: '【成瀬】商品券（釣無し）（USENレジ）', isUncol: false },
+                    '商品券差額': { item: '商品券差額', isUncol: false },
+                    '商品券有': { item: '【成瀬】商品券（釣有り）（USENレジ）', isUncol: false },
+                    '商品券現金釣銭': { item: '商品券現金釣銭', isUncol: false },
+                    '掛売': { item: '【成瀬】掛売（USENレジ）', isUncol: false },
+                    '未回収': { item: '【成瀬】掛売（USENレジ）', isUncol: true } 
+                };
+
+                let dailyData = {};
+
+                // 1行ずつデータを処理
+                for (let i = headerIdx + 1; i < lines.length; i++) {
+                    let parts = lines[i];
+                    
+                    // 【修正箇所】1番左の列（集計フラグ）が空欄でもスキップしないように条件を変更
+                    if (parts.length === 0 || parts[0] === 'TOTAL') continue;
+
+                    let row = {};
+                    header.forEach((h, idx) => { row[h] = parts[idx]; });
+
+                    // 伝票番号がない行はスキップ
+                    if (!row['H.伝票番号'] || String(row['H.伝票番号']).trim() === '') continue;
+
+                    // 【追加箇所】分割会計の重複データ（レジ担当者IDが空）はスキップ
+                    if (!row['H.レジ担当者ID'] || String(row['H.レジ担当者ID']).trim() === '') continue;
+
+                    let dateRaw = String(row['H.集計対象営業年月日'] || '');
+                    let dateMatch = dateRaw.match(/(\d{4}\/\d{2}\/\d{2})/);
+                    if (!dateMatch) continue;
+                    let date = dateMatch[1];
+
+                    if (!dailyData[date]) {
+                        dailyData[date] = {};
+                        for (let pk in payProperties) {
+                            dailyData[date][pk] = { s10: 0, t10: 0, s8: 0, t8: 0, snon: 0, sun: 0 };
+                        }
+                    }
+
+                    // 売上集計
+                    let s10 = cleanValue(row['H.税抜金額10%']) + cleanValue(row['H.税額10%']);
+                    let t10 = cleanValue(row['H.税額10%']);
+                    let s8 = cleanValue(row['H.税抜金額8%']) + cleanValue(row['H.税額8%']);
+                    let t8 = cleanValue(row['H.税額8%']);
+                    let snon = cleanValue(row['H.非課税金額']);
+                    let sun = cleanValue(row['H.不課税金額']);
+
+                    let totalSales = s10 + s8 + snon + sun;
+
+                    // 売上が0でも小計があれば強制認識 (未収金対策)
+                    let shokei = cleanValue(row['H.小計']);
+                    let denpyo = cleanValue(row['H.伝票金額']);
+                    let fallbackSales = Math.max(shokei, denpyo);
+
+                    if (totalSales === 0 && fallbackSales > 0) {
+                        s10 = fallbackSales;
+                        t10 = Math.round(fallbackSales - (fallbackSales / 1.1));
+                        totalSales = fallbackSales;
+                    }
+
+                    if (totalSales === 0) continue;
+
+                    // 入金集計
+                    let payAmounts = {};
+                    let totalPay = 0;
+                    for (let csvCol in csvPayCols) {
+                        let amt = cleanValue(row[csvCol]);
+                        if (amt !== 0) {
+                            let pk = csvPayCols[csvCol];
+                            payAmounts[pk] = (payAmounts[pk] || 0) + amt;
+                            totalPay += amt;
+                        }
+                    }
+
+                    // 入金不足・0円の場合は未回収として計上
+                    if (totalPay === 0 && totalSales > 0) {
+                        payAmounts['未回収'] = totalSales;
+                        totalPay = totalSales;
+                    } else if (totalPay < totalSales) {
+                        let uncolAmt = totalSales - totalPay;
+                        payAmounts['未回収'] = (payAmounts['未回収'] || 0) + uncolAmt;
+                        totalPay = totalSales;
+                    }
+
+                    if (totalPay === 0) continue;
+
+                    // 割り振り処理
+                    for (let pk in payAmounts) {
+                        let payAmt = payAmounts[pk];
+                        let ratio = payAmt / totalPay;
+                        
+                        let p10 = Math.round(s10 * ratio);
+                        let pt10 = Math.round(t10 * ratio);
+                        let p8 = Math.round(s8 * ratio);
+                        let pt8 = Math.round(t8 * ratio);
+                        let pnon = Math.round(snon * ratio);
+                        let pun = Math.round(sun * ratio);
+                        
+                        // 端数調整
+                        let diff = payAmt - (p10 + p8 + pnon + pun);
+                        if (diff !== 0) {
+                            let comps = [
+                                {key: '10', val: p10}, {key: '8', val: p8},
+                                {key: 'non', val: pnon}, {key: 'un', val: pun}
+                            ].sort((a, b) => b.val - a.val);
+                            
+                            if (comps[0].key === '10') p10 += diff;
+                            else if (comps[0].key === '8') p8 += diff;
+                            else if (comps[0].key === 'non') pnon += diff;
+                            else if (comps[0].key === 'un') pun += diff;
+                        }
+
+                        dailyData[date][pk].s10 += p10;
+                        dailyData[date][pk].t10 += pt10;
+                        dailyData[date][pk].s8 += p8;
+                        dailyData[date][pk].t8 += pt8;
+                        dailyData[date][pk].snon += pnon;
+                        dailyData[date][pk].sun += pun;
+                    }
+                }
+
+                const freeeColumns = [
+                    '収支区分', '管理番号', '発生日', '決済期日', '取引先', '取引先コード', 
+                    '勘定科目', '税区分', '金額', '税計算区分', '税額', '備考', '品目', '部門', 
+                    'メモタグ（複数指定可、カンマ区切り）', '決済日', '決済口座', '決済金額', 
+                    'セグメント1', 'セグメント2', 'セグメント3'
+                ];
+
+                let freeeEntries = [];
+
+                // 出力フォーマットの生成（1日1伝票）
+                let dates = Object.keys(dailyData).sort();
+                dates.forEach(date => {
+                    let manageNo = date.replace(/\//g, '');
+                    let isFirstForDay = true;
+
+                    for (let pk in payProperties) {
+                        let props = payProperties[pk];
+                        let vals = dailyData[date][pk];
+                        let totalAmt = vals.s10 + vals.s8 + vals.snon + vals.sun;
+
+                        if (totalAmt > 0) {
+                            let addEntry = (taxName, amt, tax, baseTag) => {
+                                if (amt > 0) {
+                                    let entry = {};
+                                    freeeColumns.forEach(c => entry[c] = '');
+
+                                    if (isFirstForDay) {
+                                        entry['収支区分'] = '収入';
+                                        entry['管理番号'] = manageNo;
+                                        entry['発生日'] = date;
+                                    }
+
+                                    entry['勘定科目'] = 'FCうなぎ売上';
+                                    entry['税区分'] = taxName;
+                                    entry['金額'] = amt;
+                                    entry['税計算区分'] = '税込';
+                                    entry['税額'] = tax;
+
+                                    if (props.isUncol) {
+                                        entry['備考'] = `${baseTag} 未収金`;
+                                        entry['メモタグ（複数指定可、カンマ区切り）'] = `${baseTag},未収金`;
+                                    } else {
+                                        entry['備考'] = baseTag;
+                                        entry['メモタグ（複数指定可、カンマ区切り）'] = baseTag;
+                                    }
+
+                                    entry['品目'] = props.item;
+                                    entry['部門'] = '鰻の成瀬防府店';
+                                    
+                                    // 全て決済日・口座を入れる
+                                    entry['決済日'] = date;
+                                    entry['決済口座'] = '成瀬売上口座';
+                                    entry['決済金額'] = amt;
+
+                                    freeeEntries.push(entry);
+                                    isFirstForDay = false;
+                                }
+                            };
+
+                            addEntry('課税売上10%', vals.s10, vals.t10, '店内飲食');
+                            addEntry('課税売上8%（軽）', vals.s8, vals.t8, 'テイクアウト');
+                            addEntry('非課税売上', vals.snon, 0, 'その他売上（非課税）');
+                            addEntry('対象外', vals.sun, 0, 'その他売上（対象外）');
+                        }
+                    }
+                });
+
+                if (freeeEntries.length === 0) continue;
+
+                // --- Excel作成 ---
+                const workbook = new ExcelJS.Workbook();
+                const worksheet = workbook.addWorksheet('Sheet1', { views: [{ state: 'frozen', xSplit: 1, ySplit: 1 }] });
+
+                const headerRow = worksheet.addRow(freeeColumns);
+                headerRow.eachCell((cell) => {
+                    cell.font = { name: 'Meiryo', size: 11, bold: true };
+                    cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFDDEBF7' } };
+                    cell.alignment = { horizontal: 'center', vertical: 'middle' };
+                });
+
+                freeeEntries.forEach(entry => {
+                    const rowData = freeeColumns.map(col => entry[col]);
+                    const row = worksheet.addRow(rowData);
+                    row.eachCell((cell, colNumber) => {
+                        cell.font = { name: 'Meiryo', size: 11 };
+                        if ([9, 11, 18].includes(colNumber) && cell.value !== '') {
+                            cell.value = Number(cell.value);
+                            cell.numFmt = '#,##0';
+                        }
+                    });
+                });
+
+                worksheet.columns.forEach((col, index) => {
+                    const colIdx = index + 1;
+                    if (colIdx === 2) col.width = 20;
+                    else if ([12, 13, 14, 15, 17].includes(colIdx)) col.width = 25;
+                    else col.width = 15;
+                });
+
+                const buffer = await workbook.xlsx.writeBuffer();
+                const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+                const link = document.createElement("a");
+                link.href = URL.createObjectURL(blob);
+                link.download = file.name.replace(/\.[^/.]+$/, "") + "_freee収入.xlsx";
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+            }
+
+            alert("Excelファイルの作成が完了しました！");
+            selectedFiles = [];
+            updateFileList();
+
+        } catch (error) {
+            console.error(error);
+            alert("エラーが発生しました: " + error.message);
+        } finally {
+            executeBtn.disabled = selectedFiles.length === 0;
+            executeBtn.innerText = "Excelに変換してダウンロード";
+        }
+    });
+</script>
+</body>
+</html>
